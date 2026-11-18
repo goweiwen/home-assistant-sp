@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -12,6 +11,11 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .client import AuthError, Session, SpGroupClient, UsageError, session_entry_data
 from .const import (
@@ -33,7 +37,7 @@ MAX_PASSWORD_CHARS = 1024
 _PASSWORD_VALIDATOR = vol.All(str, vol.Length(min=1, max=MAX_PASSWORD_CHARS))
 
 _CREDENTIALS = {
-    vol.Required(CONF_USERNAME): vol.All(str, validate_username),
+    vol.Required(CONF_USERNAME): str,
     vol.Required(CONF_PASSWORD): _PASSWORD_VALIDATOR,
 }
 
@@ -82,30 +86,17 @@ async def _validate(
     return _entry_data(client, username)
 
 
-def _price_field(value: object) -> float | str:
-    """The options form's price field: a non-negative number, or ``""``.
+def _username_errors(username: str) -> dict[str, str]:
+    """The form error for a username that cannot be an address, else none.
 
-    The shipped option description tells the user to leave the field empty to
-    disable the cost series, and the form framework submits an untouched
-    optional field as an empty string. Coercing that with ``float()`` raised a
-    form error instead, so the one way the description offers to turn the cost
-    series off was a validation failure. Zero is accepted here and carries no
-    price, as ``parse_electricity_price`` decides for the reader.
+    The check runs here and not in the schema, because Home Assistant cannot
+    send a schema that holds a plain function to the frontend.
     """
-    if isinstance(value, str):
-        if not value.strip():
-            return ""
-        try:
-            number = float(value.strip())
-        except ValueError as exc:
-            raise vol.Invalid(f"{CONF_ELECTRICITY_PRICE} must be a number") from exc
-    elif isinstance(value, bool) or not isinstance(value, int | float):
-        raise vol.Invalid(f"{CONF_ELECTRICITY_PRICE} must be a number")
-    else:
-        number = float(value)
-    if not math.isfinite(number) or number < 0:
-        raise vol.Invalid(f"{CONF_ELECTRICITY_PRICE} must be zero or more")
-    return number
+    try:
+        validate_username(username)
+    except ValueError:
+        return {CONF_USERNAME: "invalid_username"}
+    return {}
 
 
 def _auth_error_key(exc: AuthError) -> str:
@@ -128,6 +119,28 @@ def _report_failure(step: str, exc: Exception, errors: dict[str, str]) -> None:
     _LOGGER.warning("SP Group %s failed: %s", step, exc, exc_info=exc)
 
 
+def _options_schema(current: object) -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_ELECTRICITY_PRICE,
+                description={"suggested_value": current},
+            ): NumberSelector(
+                NumberSelectorConfig(min=0, step="any", mode=NumberSelectorMode.BOX)
+            ),
+        }
+    )
+
+
+def _credentials_schema(username: str) -> vol.Schema:
+    return vol.Schema(
+        {
+            **_CREDENTIALS,
+            vol.Required(CONF_USERNAME, default=username): str,
+        }
+    )
+
+
 class SpGroupOptionsFlow(config_entries.OptionsFlow):
     """A fixed electricity price so the Energy dashboard can show cost."""
 
@@ -147,16 +160,12 @@ class SpGroupOptionsFlow(config_entries.OptionsFlow):
                     if key != CONF_ELECTRICITY_PRICE
                 }
             return self.async_create_entry(title="", data=options)
-        current = self.config_entry.options.get(CONF_ELECTRICITY_PRICE)
-        schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_ELECTRICITY_PRICE,
-                    description={"suggested_value": current},
-                ): _price_field,
-            }
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_options_schema(
+                self.config_entry.options.get(CONF_ELECTRICITY_PRICE)
+            ),
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
 
 
 class SpGroupConfigFlow(  # type: ignore[call-arg]  # domain= is ConfigFlow's own
@@ -257,8 +266,10 @@ class SpGroupConfigFlow(  # type: ignore[call-arg]  # domain= is ConfigFlow's ow
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        errors: dict[str, str] = {}
-        if user_input is not None:
+        errors = (
+            {} if user_input is None else _username_errors(user_input[CONF_USERNAME])
+        )
+        if user_input is not None and not errors:
             await self.async_set_unique_id(fold_text(user_input[CONF_USERNAME]))
             self._abort_if_unique_id_configured()
             try:
@@ -314,8 +325,10 @@ class SpGroupConfigFlow(  # type: ignore[call-arg]  # domain= is ConfigFlow's ow
         The reauth and the reconfigure flow ask the same question and differ
         only in which step they show and which entry they update.
         """
-        errors: dict[str, str] = {}
-        if user_input is not None:
+        errors = (
+            {} if user_input is None else _username_errors(user_input[CONF_USERNAME])
+        )
+        if user_input is not None and not errors:
             try:
                 data = await _validate(
                     self.hass,
@@ -334,14 +347,6 @@ class SpGroupConfigFlow(  # type: ignore[call-arg]  # domain= is ConfigFlow's ow
                 return self.async_update_reload_and_abort(entry, data_updates=data)
         return self.async_show_form(
             step_id=step_id,
-            data_schema=vol.Schema(
-                {
-                    **_CREDENTIALS,
-                    vol.Required(
-                        CONF_USERNAME,
-                        default=entry.data.get(CONF_USERNAME, ""),
-                    ): vol.All(str, validate_username),
-                }
-            ),
+            data_schema=_credentials_schema(entry.data.get(CONF_USERNAME, "")),
             errors=errors,
         )
